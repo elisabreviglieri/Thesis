@@ -39,13 +39,14 @@ def train_one_mode(
     batch_size: int = 4096,
     lr: float = 2e-4,
     weight_decay: float = 0.0,
-    patience: int = 30,
+    patience: int = 100,
     min_delta: float = 1e-4,
     verbose_every: int = 10,
     loss_type: str = "mse",
     huber_delta: float = 1.0,
-    init_state_dict: dict | None = None,   # NEW (fine-tuning)
-    strict_init: bool = True,              # NEW
+    init_state_dict: dict | None = None,
+    strict_init: bool = True,
+    hidden=None,                      # NEW -> to allow for deeper nn
 ) -> Dict[str, Any]:
     """
     Train one CFM model on ONE scaling mode folder (prepared splits already scaled).
@@ -86,7 +87,8 @@ def train_one_mode(
     # -----------------------
     net = model.ConditionalVelocityField(
         x_dim=len(y_cols),
-        context_dim=len(train_cols),
+        context_dim=len(train_cols),            
+        hidden=hidden,                    # NEW
     ).to(device)
 
     # ---- Fine-tuning init (optional)
@@ -210,6 +212,7 @@ def train_one_mode(
             "huber_delta": huber_delta,
             "strict_init": strict_init,
             "used_init_state": (init_state_dict is not None),
+            "hidden": hidden,   # NEW
         },
     }
 
@@ -247,14 +250,19 @@ def load_run(save_dir: str, device: str | torch.device = None) -> Dict[str, Any]
 
     train_cols = meta["train_cols"]
     y_cols = meta["y_cols"]
+    hyperparams = meta.get("hyperparams", {})
+
+    hidden = hyperparams.get("hidden", None)
 
     net = model.ConditionalVelocityField(
         x_dim=len(y_cols),
         context_dim=len(train_cols),
+        hidden=hidden,
     ).to(device)
 
     state = torch.load(os.path.join(save_dir, "model_state.pt"), map_location="cpu")
     net.load_state_dict(state)
+    net.eval()
 
     res = {
         "model": net,
@@ -264,8 +272,122 @@ def load_run(save_dir: str, device: str | torch.device = None) -> Dict[str, Any]
         "scalers": scalers,
         "mode_dir": meta.get("mode_dir", None),
         "loss_history": meta.get("loss_history", None),
-        "hyperparams": meta.get("hyperparams", None),
+        "hyperparams": hyperparams,
         "save_dir": save_dir,
     }
 
     return res
+
+
+def train_regressor(
+    mode_dir: str,
+    train_cols: list,
+    y_cols: list,
+    device: str = None,
+    epochs: int = 5000,
+    batch_size: int = 4096,
+    lr: float = 2e-4,
+    weight_decay: float = 0.0,
+    patience: int = 100,
+    min_delta: float = 1e-4,
+    verbose_every: int = 10,
+    huber_delta: float = 1.0,
+    hidden: tuple = (256, 256, 256, 256, 256),
+) -> dict:
+    """
+    Addestra un regressore diretto con Huber loss.
+    Stesso setup del CFM: stessi dati, stesso scaling, stessa architettura.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    df_tr, df_va, df_te, scalers = load_prepared(mode_dir)
+
+    Xtr = df_tr[train_cols].to_numpy(np.float32)
+    ytr = df_tr[y_cols].to_numpy(np.float32)
+    Xva = df_va[train_cols].to_numpy(np.float32)
+    yva = df_va[y_cols].to_numpy(np.float32)
+
+    ds_tr = model.TabularFMDataset(Xtr, ytr)
+    ds_va = model.TabularFMDataset(Xva, yva)
+    dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True)
+    dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False)
+
+    net = model.DirectRegressor(
+        y_dim=len(y_cols),
+        context_dim=len(train_cols),
+        hidden=hidden,
+    ).to(device)
+
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+
+    hist = {"train": [], "val": []}
+    best_val = float("inf")
+    best_state = None
+    bad = 0
+
+    for ep in range(1, epochs + 1):
+
+        net.train()
+        tr_losses = []
+        for xb, yb in dl_tr:
+            xb, yb = xb.to(device), yb.to(device)
+            loss = model.regressor_loss_huber(net, xb, yb, delta=huber_delta)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tr_losses.append(loss.item())
+
+        net.eval()
+        va_losses = []
+        with torch.no_grad():
+            for xb, yb in dl_va:
+                xb, yb = xb.to(device), yb.to(device)
+                loss = model.regressor_loss_huber(net, xb, yb, delta=huber_delta)
+                va_losses.append(loss.item())
+
+        tr_mean = float(np.mean(tr_losses))
+        va_mean = float(np.mean(va_losses))
+        hist["train"].append(tr_mean)
+        hist["val"].append(va_mean)
+
+        if (best_val - va_mean) > min_delta:
+            best_val = va_mean
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in net.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+
+        if verbose_every and (ep == 1 or ep % verbose_every == 0):
+            print(f"[ep {ep:4d}] train={tr_mean:.6f}  "
+                  f"val={va_mean:.6f}  best={best_val:.6f}  "
+                  f"bad={bad}/{patience}")
+
+        if bad >= patience:
+            print(f"Early stopping at ep {ep} (best val={best_val:.6f})")
+            break
+
+    if best_state is not None:
+        net.load_state_dict(best_state)
+
+    return {
+        "model": net,
+        "model_type": "regressor",
+        "device": str(device),
+        "train_cols": list(train_cols),
+        "y_cols": list(y_cols),
+        "loss_history": hist,
+        "scalers": scalers,
+        "mode_dir": mode_dir,
+        "hyperparams": {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "patience": patience,
+            "min_delta": min_delta,
+            "huber_delta": huber_delta,
+            "hidden": hidden,
+        },
+    }

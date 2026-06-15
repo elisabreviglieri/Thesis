@@ -2,6 +2,8 @@
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
+
 
 def compute_S_over_B(
     df,
@@ -189,3 +191,26 @@ def find_peak_position(masses, bins=120, range_=(0,300)):
     centers = 0.5 * (edges[:-1] + edges[1:])
     peak_bin = np.argmax(hist)
     return centers[peak_bin]
+
+
+
+def fit_signal_window(masses):
+
+    mu, sigma = norm.fit(masses)
+
+    low = mu - 2*sigma
+    high = mu + 2*sigma
+
+    return mu, sigma, low, high
+
+def compute_SB(signal, background, window):
+
+    low, high = window
+
+    S = ((signal > low) & (signal < high)).sum()
+    B = ((background > low) & (background < high)).sum()
+
+    SB = S / B if B > 0 else np.nan
+    SsqrtB = S / np.sqrt(B) if B > 0 else np.nan
+
+    return S, B, SB, SsqrtB

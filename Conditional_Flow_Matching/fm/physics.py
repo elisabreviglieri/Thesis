@@ -77,3 +77,39 @@ def inv_mass_two_taus_corrected_ratio(
         pt1_corr, eta1, phi1, m1,
         pt2_corr, eta2, phi2, m2,
     )
+    
+    
+    
+def delta_phi(phi1, phi2):
+    phi1 = np.asarray(phi1)
+    phi2 = np.asarray(phi2)
+
+    return np.arctan2(
+        np.sin(phi1 - phi2),
+        np.cos(phi1 - phi2),
+    )
+
+
+def delta_R(eta1, phi1, eta2, phi2):
+    eta1 = np.asarray(eta1)
+    eta2 = np.asarray(eta2)
+
+    d_eta = eta1 - eta2
+    d_phi = delta_phi(phi1, phi2)
+
+    return np.sqrt(d_eta**2 + d_phi**2)
+
+
+def pt_two_objects(pt1, eta1, phi1, m1,
+                   pt2, eta2, phi2, m2):
+    """
+    Transverse momentum of the system made by two objects.
+    """
+    E1, px1, py1, pz1 = pt_eta_phi_m_to_p4(pt1, eta1, phi1, m1)
+    E2, px2, py2, pz2 = pt_eta_phi_m_to_p4(pt2, eta2, phi2, m2)
+
+    px = px1 + px2
+    py = py1 + py2
+
+    return np.sqrt(px**2 + py**2)
+

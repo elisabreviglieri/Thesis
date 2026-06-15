@@ -123,6 +123,7 @@ VALID_SCALING_MODES = {
     "X_GLOBAL__Y_LOCAL",    # requires class
     "X_LOCAL__Y_LOCAL",     # requires class
     "X_NONE__Y_LOCAL",      # requires class
+    "X_LOCAL__Y_GLOBAL"     # requires class    
 }
 
 
@@ -132,23 +133,12 @@ def fit_scalers(
     y_cols: list,
     mode: str = "X_NONE__Y_NONE",
     class_col: str = "class",
+    x_scale_cols: list | None = None,
 ) -> dict:
-    """
-    Fit scalers ONLY on the training split.
 
-    Universal modes:
-      - X_NONE__Y_NONE
-      - X_GLOBAL__Y_GLOBAL
-
-    Class-conditional modes (require class_col):
-      - X_GLOBAL__Y_LOCAL
-      - X_LOCAL__Y_LOCAL
-      - X_NONE__Y_LOCAL
-    """
     if mode not in VALID_SCALING_MODES:
         raise ValueError(f"Unknown scaling mode '{mode}'. Valid: {sorted(VALID_SCALING_MODES)}")
 
-    # checks X/Y exist
     for c in train_cols:
         if c not in df_train.columns:
             raise ValueError(f"Missing train column '{c}' in df_train.")
@@ -156,23 +146,33 @@ def fit_scalers(
         if c not in df_train.columns:
             raise ValueError(f"Missing target column '{c}' in df_train.")
 
-    scalers = {"mode": mode, "class_col": class_col}
+    if x_scale_cols is None:
+        x_scale_cols = list(train_cols)
 
-    # ---- Mode: no scaling (universal)
+    for c in x_scale_cols:
+        if c not in train_cols:
+            raise ValueError(f"x_scale_cols contains '{c}', which is not in train_cols.")
+        if c not in df_train.columns:
+            raise ValueError(f"Missing x-scale column '{c}' in df_train.")
+
+    scalers = {
+        "mode": mode,
+        "class_col": class_col,
+        "x_scale_cols": list(x_scale_cols),
+    }
+
     if mode == "X_NONE__Y_NONE":
         scalers["x_scaler"] = None
         scalers["y_scaler"] = None
         return scalers
 
-    # ---- Mode: global/global (universal)
     if mode == "X_GLOBAL__Y_GLOBAL":
-        sx = StandardScaler().fit(df_train[train_cols].to_numpy())
+        sx = StandardScaler().fit(df_train[x_scale_cols].to_numpy())
         sy = StandardScaler().fit(df_train[y_cols].to_numpy())
         scalers["x_scaler"] = sx
         scalers["y_scaler"] = sy
         return scalers
 
-    # ---- From here on: require class
     if class_col not in df_train.columns:
         raise ValueError(f"Missing class column '{class_col}' in df_train (required for mode {mode}).")
 
@@ -181,36 +181,40 @@ def fit_scalers(
     if len(df_dy) == 0 or len(df_h) == 0:
         raise ValueError("One of the classes is empty in df_train; cannot fit class-conditional scalers.")
 
-    # ---- helpers
     def fit_y_local():
         s0 = StandardScaler().fit(df_dy[y_cols].to_numpy())
         s1 = StandardScaler().fit(df_h[y_cols].to_numpy())
         return {0: s0, 1: s1}
+    
+    def fit_y_global():
+        return StandardScaler().fit(df_train[y_cols].to_numpy())
 
     def fit_x_global():
-        return StandardScaler().fit(df_train[train_cols].to_numpy())
+        return StandardScaler().fit(df_train[x_scale_cols].to_numpy())
 
     def fit_x_local():
-        s0 = StandardScaler().fit(df_dy[train_cols].to_numpy())
-        s1 = StandardScaler().fit(df_h[train_cols].to_numpy())
+        s0 = StandardScaler().fit(df_dy[x_scale_cols].to_numpy())
+        s1 = StandardScaler().fit(df_h[x_scale_cols].to_numpy())
         return {0: s0, 1: s1}
 
-    # ---- Mode: X global + Y local
     if mode == "X_GLOBAL__Y_LOCAL":
         scalers["x_scaler"] = fit_x_global()
         scalers["y_scaler"] = fit_y_local()
         return scalers
 
-    # ---- Mode: X local + Y local
     if mode == "X_LOCAL__Y_LOCAL":
         scalers["x_scaler"] = fit_x_local()
         scalers["y_scaler"] = fit_y_local()
         return scalers
 
-    # ---- Mode: X none + Y local
     if mode == "X_NONE__Y_LOCAL":
         scalers["x_scaler"] = None
         scalers["y_scaler"] = fit_y_local()
+        return scalers
+    
+    if mode == "X_LOCAL__Y_GLOBAL":
+        scalers["x_scaler"] = fit_x_local()
+        scalers["y_scaler"] = fit_y_global()
         return scalers
 
     raise RuntimeError("Unhandled scaling mode.")
@@ -222,59 +226,54 @@ def transform_df(
     y_cols: list,
     scalers: dict,
 ) -> pd.DataFrame:
-    """
-    Apply fitted scalers to a DataFrame and return a COPY with scaled columns overwritten.
-    Robust to mixed dtypes across columns: assigns column-by-column with explicit casting.
 
-    Universal modes do NOT require class column.
-    Class-conditional modes require class column.
-    """
     mode = scalers.get("mode", None)
     class_col = scalers.get("class_col", "class")
+    x_scale_cols = scalers.get("x_scale_cols", list(train_cols))
 
     if mode not in VALID_SCALING_MODES:
         raise ValueError(f"Invalid scalers['mode'] = {mode}")
 
     out = df.copy()
 
-    # quick exit (universal)
     if mode == "X_NONE__Y_NONE":
         return out
 
     x_scaler = scalers.get("x_scaler", None)
     y_scaler = scalers.get("y_scaler", None)
 
-    # helper: assign scaled array to cols safely (preserve per-column dtype)
-    def _assign_cols(mask, cols, arr_2d):
-        for j, col in enumerate(cols):
-            target_dtype = out[col].dtype
-            out.loc[mask, col] = arr_2d[:, j].astype(target_dtype, copy=False)
+    def assign_cols(mask, cols, arr):
+        arr = arr.astype(np.float32)
 
-    # helper for dict scalers: need class masks
+        for j, col in enumerate(cols):
+            out.loc[mask, col] = pd.Series(
+                arr[:, j],
+                index=out.loc[mask].index,
+                dtype=np.float32,
+        )
+
     def _get_class_masks():
         if class_col not in out.columns:
             raise ValueError(f"Missing class column '{class_col}' in df (required for mode {mode}).")
         c = out[class_col].to_numpy()
         return (c == 0), (c == 1)
 
-    # ---- X transform
     if x_scaler is None:
         pass
     elif isinstance(x_scaler, StandardScaler):
-        X = x_scaler.transform(out[train_cols].to_numpy())
-        _assign_cols(slice(None), train_cols, X)
+        X = x_scaler.transform(out[x_scale_cols].to_numpy())
+        _assign_cols(slice(None), x_scale_cols, X)
     elif isinstance(x_scaler, dict):
         m0, m1 = _get_class_masks()
         if m0.any():
-            X0 = x_scaler[0].transform(out.loc[m0, train_cols].to_numpy())
-            _assign_cols(m0, train_cols, X0)
+            X0 = x_scaler[0].transform(out.loc[m0, x_scale_cols].to_numpy())
+            _assign_cols(m0, x_scale_cols, X0)
         if m1.any():
-            X1 = x_scaler[1].transform(out.loc[m1, train_cols].to_numpy())
-            _assign_cols(m1, train_cols, X1)
+            X1 = x_scaler[1].transform(out.loc[m1, x_scale_cols].to_numpy())
+            _assign_cols(m1, x_scale_cols, X1)
     else:
         raise ValueError("x_scaler must be None, a StandardScaler, or a dict {0,1}.")
 
-    # ---- Y transform
     if y_scaler is None:
         pass
     elif isinstance(y_scaler, StandardScaler):
@@ -293,7 +292,6 @@ def transform_df(
 
     return out
 
-
 def prepare_splits_with_scaling(
     df_train: pd.DataFrame,
     df_val: pd.DataFrame,
@@ -302,6 +300,7 @@ def prepare_splits_with_scaling(
     y_cols: list,
     mode: str = "X_NONE__Y_NONE",
     class_col: str = "class",
+    x_scale_cols: list | None = None,
 ):
     """
     Convenience helper:
@@ -315,6 +314,7 @@ def prepare_splits_with_scaling(
         y_cols=y_cols,
         mode=mode,
         class_col=class_col,
+        x_scale_cols=x_scale_cols,
     )
 
     df_train_s = transform_df(df_train, train_cols, y_cols, scalers)
@@ -327,7 +327,6 @@ def prepare_splits_with_scaling(
         df_test_s.reset_index(drop=True),
         scalers,
     )
-
 
 # ============================================================
 # Prepared splits saver (used by training.load_prepared)
@@ -452,3 +451,187 @@ def apply_and_save_selected_scalings(
         mode_dirs[mode] = mode_dir
 
     return mode_dirs
+
+
+# ===================================
+# MULTICLASS FUNCTIONS (TTbar added)
+# ===================================
+
+def fit_scalers_multiclass(
+    df_train: pd.DataFrame,
+    train_cols: list,
+    y_cols: list,
+    mode: str = "X_NONE__Y_NONE",
+    class_col: str = "class",
+    x_scale_cols: list | None = None,
+) -> dict:
+
+    if mode not in VALID_SCALING_MODES:
+        raise ValueError(f"Unknown scaling mode '{mode}'.")
+
+    if x_scale_cols is None:
+        x_scale_cols = list(train_cols)
+
+    classes = sorted(df_train[class_col].dropna().unique())
+
+    scalers = {
+        "mode": mode,
+        "class_col": class_col,
+        "x_scale_cols": list(x_scale_cols),
+        "classes": classes,
+    }
+
+    if mode == "X_NONE__Y_NONE":
+        scalers["x_scaler"] = None
+        scalers["y_scaler"] = None
+        return scalers
+
+    if mode == "X_GLOBAL__Y_GLOBAL":
+        scalers["x_scaler"] = StandardScaler().fit(df_train[x_scale_cols].to_numpy())
+        scalers["y_scaler"] = StandardScaler().fit(df_train[y_cols].to_numpy())
+        return scalers
+
+    def fit_local(cols):
+        out = {}
+        for cls in classes:
+            df_cls = df_train[df_train[class_col] == cls]
+            if len(df_cls) == 0:
+                raise ValueError(f"Class {cls} is empty.")
+            out[cls] = StandardScaler().fit(df_cls[cols].to_numpy())
+        return out
+
+    def fit_global(cols):
+        return StandardScaler().fit(df_train[cols].to_numpy())
+
+    if mode == "X_GLOBAL__Y_LOCAL":
+        scalers["x_scaler"] = fit_global(x_scale_cols)
+        scalers["y_scaler"] = fit_local(y_cols)
+        return scalers
+
+    if mode == "X_LOCAL__Y_LOCAL":
+        scalers["x_scaler"] = fit_local(x_scale_cols)
+        scalers["y_scaler"] = fit_local(y_cols)
+        return scalers
+
+    if mode == "X_NONE__Y_LOCAL":
+        scalers["x_scaler"] = None
+        scalers["y_scaler"] = fit_local(y_cols)
+        return scalers
+
+    if mode == "X_LOCAL__Y_GLOBAL":
+        scalers["x_scaler"] = fit_local(x_scale_cols)
+        scalers["y_scaler"] = fit_global(y_cols)
+        return scalers
+
+    raise RuntimeError("Unhandled scaling mode.")
+
+def transform_df_multiclass(
+    df: pd.DataFrame,
+    train_cols: list,
+    y_cols: list,
+    scalers: dict,
+) -> pd.DataFrame:
+
+    mode = scalers["mode"]
+    class_col = scalers.get("class_col", "class")
+    x_scale_cols = scalers.get("x_scale_cols", list(train_cols))
+
+    out = df.copy()
+
+    if mode == "X_NONE__Y_NONE":
+        return out
+
+    def assign_cols(mask, cols, arr):
+        for j, col in enumerate(cols):
+            out.loc[mask, col] = arr[:, j]
+
+    def apply_scaler_to_classes(scaler_dict, cols):
+        for cls, scaler in scaler_dict.items():
+            mask = out[class_col] == cls
+            if mask.any():
+                arr = scaler.transform(out.loc[mask, cols].to_numpy())
+                assign_cols(mask, cols, arr)
+
+    x_scaler = scalers.get("x_scaler")
+    y_scaler = scalers.get("y_scaler")
+
+    if isinstance(x_scaler, StandardScaler):
+        X = x_scaler.transform(out[x_scale_cols].to_numpy())
+        assign_cols(slice(None), x_scale_cols, X)
+    elif isinstance(x_scaler, dict):
+        apply_scaler_to_classes(x_scaler, x_scale_cols)
+
+    if isinstance(y_scaler, StandardScaler):
+        Y = y_scaler.transform(out[y_cols].to_numpy())
+        assign_cols(slice(None), y_cols, Y)
+    elif isinstance(y_scaler, dict):
+        apply_scaler_to_classes(y_scaler, y_cols)
+
+    return out
+
+def prepare_splits_with_scaling_multiclass(
+    df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
+    df_test: pd.DataFrame,
+    train_cols: list,
+    y_cols: list,
+    mode: str = "X_NONE__Y_NONE",
+    class_col: str = "class",
+    x_scale_cols: list | None = None,
+):
+
+    scalers = fit_scalers_multiclass(
+        df_train=df_train,
+        train_cols=train_cols,
+        y_cols=y_cols,
+        mode=mode,
+        class_col=class_col,
+        x_scale_cols=x_scale_cols,
+    )
+
+    df_train_s = transform_df_multiclass(df_train, train_cols, y_cols, scalers)
+    df_val_s   = transform_df_multiclass(df_val,   train_cols, y_cols, scalers)
+    df_test_s  = transform_df_multiclass(df_test,  train_cols, y_cols, scalers)
+
+    return (
+        df_train_s.reset_index(drop=True),
+        df_val_s.reset_index(drop=True),
+        df_test_s.reset_index(drop=True),
+        scalers,
+    )
+    
+
+def apply_and_save_all_scalings_multiclass(
+    df_train, df_val, df_test,
+    dataset_tag: str,
+    train_cols, y_cols,
+    outdir: str,
+):
+    base = os.path.join(outdir, dataset_tag)
+    os.makedirs(base, exist_ok=True)
+
+    saved_paths = {}
+
+    for mode in SCALING_MODES:
+        df_tr_s, df_va_s, df_te_s, scalers = prepare_splits_with_scaling_multiclass(
+            df_train, df_val, df_test,
+            train_cols=train_cols,
+            y_cols=y_cols,
+            mode=mode,
+            class_col="class",
+        )
+
+        mode_dir = os.path.join(base, mode)
+        os.makedirs(mode_dir, exist_ok=True)
+
+        df_tr_s.to_pickle(os.path.join(mode_dir, "train.pkl"))
+        df_va_s.to_pickle(os.path.join(mode_dir, "val.pkl"))
+        df_te_s.to_pickle(os.path.join(mode_dir, "test.pkl"))
+
+        joblib.dump(scalers, os.path.join(mode_dir, "scalers.joblib"))
+
+        saved_paths[mode] = mode_dir
+        print(f"[{dataset_tag}] saved {mode} -> {mode_dir}")
+
+    return saved_paths
+

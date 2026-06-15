@@ -1088,3 +1088,323 @@ def train_selected_features_variant(
 
     return res
 
+
+
+def train_selected_features_variant_with_y(
+    df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
+    df_test: pd.DataFrame,
+    selected_features: list,
+    x_variant: str,                  # "global" or "local"
+    y_variant: str,                  # "none", "global", "local"
+    train_cols: list,
+    y_cols: list,
+    class_col: str = "class",
+    device: str | torch.device = None,
+    epochs: int = 1000,
+    batch_size: int = 4096,
+    lr: float = 2e-4,
+    weight_decay: float = 0.0,
+    patience: int = 30,
+    min_delta: float = 1e-4,
+    verbose_every: int = 10,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
+    init_state_dict: dict | None = None,
+    strict_init: bool = True,
+):
+    """
+    Train from RAW splits:
+      - only selected X features are transformed with x_variant
+      - Y is transformed with y_variant
+      - all other X remain raw
+
+    x_variant: "global" or "local"
+    y_variant: "none", "global", or "local"
+    """
+
+    if x_variant not in {"global", "local"}:
+        raise ValueError("x_variant must be 'global' or 'local'.")
+    if y_variant not in {"none", "global", "local"}:
+        raise ValueError("y_variant must be 'none', 'global', or 'local'.")
+    if class_col not in df_train.columns:
+        raise ValueError(f"Missing class column '{class_col}' in df_train.")
+
+    selected_features = list(selected_features)
+
+    for feat in selected_features:
+        if feat not in train_cols:
+            raise ValueError(f"Feature '{feat}' is not in train_cols.")
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # --------------------------------------------------
+    # Fit X scalers only on TRAIN for selected features
+    # --------------------------------------------------
+    x_feature_scalers = {}
+
+    if x_variant == "global":
+        for feat in selected_features:
+            x_feature_scalers[feat] = StandardScaler().fit(df_train[[feat]].to_numpy())
+    else:
+        df_train_dy = df_train[df_train[class_col] == 0]
+        df_train_h  = df_train[df_train[class_col] == 1]
+
+        for feat in selected_features:
+            x_feature_scalers[feat] = {
+                0: StandardScaler().fit(df_train_dy[[feat]].to_numpy()),
+                1: StandardScaler().fit(df_train_h[[feat]].to_numpy()),
+            }
+
+    # --------------------------------------------------
+    # Fit Y scaler(s) only on TRAIN
+    # --------------------------------------------------
+    if y_variant == "none":
+        y_scaler = None
+
+    elif y_variant == "global":
+        y_scaler = StandardScaler().fit(df_train[y_cols].to_numpy())
+
+    else:  # local
+        df_train_dy = df_train[df_train[class_col] == 0]
+        df_train_h  = df_train[df_train[class_col] == 1]
+
+        y_scaler = {
+            0: StandardScaler().fit(df_train_dy[y_cols].to_numpy()),
+            1: StandardScaler().fit(df_train_h[y_cols].to_numpy()),
+        }
+
+    # --------------------------------------------------
+    # Helper: transform Y only
+    # --------------------------------------------------
+    def transform_y_only(df_in, y_scaler, y_variant, y_cols, class_col):
+        out = df_in.copy()
+
+        def _assign_cols(mask, cols, arr_2d):
+            for j, col in enumerate(cols):
+                target_dtype = out[col].dtype
+                out.loc[mask, col] = arr_2d[:, j].astype(target_dtype, copy=False)
+
+        if y_variant == "none":
+            return out
+
+        if y_variant == "global":
+            Y = y_scaler.transform(out[y_cols].to_numpy())
+            _assign_cols(slice(None), y_cols, Y)
+            return out
+
+        # local
+        c = out[class_col].to_numpy()
+        m0 = (c == 0)
+        m1 = (c == 1)
+
+        if m0.any():
+            Y0 = y_scaler[0].transform(out.loc[m0, y_cols].to_numpy())
+            _assign_cols(m0, y_cols, Y0)
+
+        if m1.any():
+            Y1 = y_scaler[1].transform(out.loc[m1, y_cols].to_numpy())
+            _assign_cols(m1, y_cols, Y1)
+
+        return out
+
+    # --------------------------------------------------
+    # Transform selected X + transform Y
+    # --------------------------------------------------
+    df_tr = df_train.copy()
+    df_va = df_val.copy()
+    df_te = df_test.copy()
+
+    for feat in selected_features:
+        feat_scaler = x_feature_scalers[feat]
+
+        df_tr = transform_one_feature(
+            df_in=df_tr,
+            feature=feat,
+            mode=x_variant,
+            global_scaler=feat_scaler if x_variant == "global" else None,
+            local_scaler_dict=feat_scaler if x_variant == "local" else None,
+            class_col=class_col,
+        )
+
+        df_va = transform_one_feature(
+            df_in=df_va,
+            feature=feat,
+            mode=x_variant,
+            global_scaler=feat_scaler if x_variant == "global" else None,
+            local_scaler_dict=feat_scaler if x_variant == "local" else None,
+            class_col=class_col,
+        )
+
+        df_te = transform_one_feature(
+            df_in=df_te,
+            feature=feat,
+            mode=x_variant,
+            global_scaler=feat_scaler if x_variant == "global" else None,
+            local_scaler_dict=feat_scaler if x_variant == "local" else None,
+            class_col=class_col,
+        )
+
+    df_tr = transform_y_only(df_tr, y_scaler, y_variant, y_cols, class_col)
+    df_va = transform_y_only(df_va, y_scaler, y_variant, y_cols, class_col)
+    df_te = transform_y_only(df_te, y_scaler, y_variant, y_cols, class_col)
+
+    # --------------------------------------------------
+    # Build arrays
+    # --------------------------------------------------
+    Xtr = df_tr[train_cols].to_numpy(np.float32)
+    ytr = df_tr[y_cols].to_numpy(np.float32)
+
+    Xva = df_va[train_cols].to_numpy(np.float32)
+    yva = df_va[y_cols].to_numpy(np.float32)
+
+    # --------------------------------------------------
+    # Dataset / loaders
+    # --------------------------------------------------
+    ds_tr = model.TabularFMDataset(Xtr, ytr)
+    ds_va = model.TabularFMDataset(Xva, yva)
+
+    dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, drop_last=False)
+    dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    # --------------------------------------------------
+    # Model
+    # --------------------------------------------------
+    net = model.ConditionalVelocityField(
+        x_dim=len(y_cols),
+        context_dim=len(train_cols),
+    ).to(device)
+
+    if init_state_dict is not None:
+        missing, unexpected = net.load_state_dict(init_state_dict, strict=strict_init)
+        if (not strict_init) and (missing or unexpected):
+            print(f"[init_state_dict] missing keys: {len(missing)} | unexpected keys: {len(unexpected)}")
+
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # --------------------------------------------------
+    # Training loop
+    # --------------------------------------------------
+    hist = {"train": [], "val": []}
+    best_val = float("inf")
+    best_state = None
+    bad = 0
+
+    tag = f"{len(selected_features)}feat_X{x_variant}_Y{y_variant}"
+
+    for ep in range(1, epochs + 1):
+
+        net.train()
+        tr_losses = []
+
+        for xb, yb in dl_tr:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            if loss_type == "mse":
+                loss = model.fm_loss(net, xb, yb, device)
+            elif loss_type == "huber":
+                loss = model.fm_loss_huber(net, xb, yb, device, delta=huber_delta)
+            else:
+                raise ValueError("loss_type must be 'mse' or 'huber'")
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tr_losses.append(loss.item())
+
+        tr_mean = float(np.mean(tr_losses))
+
+        net.eval()
+        va_losses = []
+
+        with torch.no_grad():
+            for xb, yb in dl_va:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                if loss_type == "mse":
+                    loss = model.fm_loss(net, xb, yb, device)
+                elif loss_type == "huber":
+                    loss = model.fm_loss_huber(net, xb, yb, device, delta=huber_delta)
+                else:
+                    raise ValueError("loss_type must be 'mse' or 'huber'")
+
+                va_losses.append(loss.item())
+
+        va_mean = float(np.mean(va_losses))
+
+        hist["train"].append(tr_mean)
+        hist["val"].append(va_mean)
+
+        improved = (best_val - va_mean) > min_delta
+
+        if improved:
+            best_val = va_mean
+            best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+
+        if verbose_every and (ep == 1 or ep % verbose_every == 0):
+            print(
+                f"[{tag} | ep {ep:4d}] "
+                f"train={tr_mean:.6f}  val={va_mean:.6f}  "
+                f"best={best_val:.6f}  bad={bad}/{patience}"
+            )
+
+        if bad >= patience:
+            print(f"Early stopping at ep {ep} (best val={best_val:.6f})")
+            break
+
+    if best_state is not None:
+        net.load_state_dict(best_state)
+
+    # mode standard per permettere predict_tau_corr_auto
+    if y_variant == "none":
+        mode_for_predict = "X_NONE__Y_NONE"
+    elif y_variant == "global":
+        mode_for_predict = "X_NONE__Y_GLOBAL"
+    else:
+        mode_for_predict = "X_NONE__Y_LOCAL"
+
+    res = {
+        "model": net,
+        "device": str(device),
+        "train_cols": list(train_cols),
+        "y_cols": list(y_cols),
+        "selected_features": selected_features,
+        "n_selected_features": len(selected_features),
+        "x_variant": x_variant,
+        "y_variant": y_variant,
+        "x_feature_scalers": x_feature_scalers,
+        "y_scaler": y_scaler,
+        "loss_history": hist,
+        "df_splits_scaled": (df_tr, df_va, df_te),
+        "scalers": {
+            "mode": mode_for_predict,
+            "class_col": class_col,
+            "x_scaler": None,       # X già preparata nel df_splits_scaled
+            "y_scaler": y_scaler,   # serve per inverse-transform delle prediction
+            "selected_features": selected_features,
+            "x_variant": x_variant,
+            "y_variant": y_variant,
+        },
+        "hyperparams": {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "patience": patience,
+            "min_delta": min_delta,
+            "loss_type": loss_type,
+            "huber_delta": huber_delta,
+            "strict_init": strict_init,
+            "used_init_state": (init_state_dict is not None),
+        },
+    }
+
+    return res
+
+

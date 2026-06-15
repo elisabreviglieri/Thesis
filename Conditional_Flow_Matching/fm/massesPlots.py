@@ -8,7 +8,8 @@ def plot_mass_overlay(masses_dict, title,
                       bins=120,
                       range_=None,
                       density=True,
-                      alpha=0.6):
+                      alpha=0.6,
+                      logy=False):
 
     plt.figure(figsize=(9,5))
 
@@ -28,9 +29,12 @@ def plot_mass_overlay(masses_dict, title,
     plt.ylabel("density" if density else "counts")
     plt.title(title)
     plt.legend(fontsize=8, loc="upper right")
+
+    if logy:
+        plt.yscale("log")
+
     plt.tight_layout()
     plt.show()
-    
     
 def plot_balanced_vs_unbalanced_by_mode(
     masses_bal: dict,
@@ -173,5 +177,121 @@ def plot_mass_A_vs_B_by_class(
         axes[1].legend(fontsize=8)
 
         fig.suptitle(f"{title_prefix} — {mode}")
+        plt.tight_layout()
+        plt.show()
+        
+        
+# Griglia di plot per comparison : balanced vs unbalanced, patience30 vs patience100 per tutti i mode
+# separando Higgs e Drell-Yan
+def plot_mass_grid_by_mode(
+    masses_a_pat30,
+    masses_a_pat100,
+    masses_b_pat30,
+    masses_b_pat100,
+    scaling_modes,
+    main_title,
+    label_a="MSE",
+    label_b="HUBER",
+    bins=120,
+    range_=(0, 300),
+    density=True,
+    add_higgs_line=False,
+):
+    for mode in scaling_modes:
+        fig, axes = plt.subplots(1, 4, figsize=(20, 4), sharey=True)
+
+        # 1) A pat30 vs A pat100
+        axes[0].hist(
+            masses_a_pat30[mode],
+            bins=bins,
+            range=range_,
+            density=density,
+            histtype="step",
+            linewidth=2,
+            label=f"{label_a} pat30",
+        )
+        axes[0].hist(
+            masses_a_pat100[mode],
+            bins=bins,
+            range=range_,
+            density=density,
+            histtype="step",
+            linewidth=2,
+            label=f"{label_a} pat100",
+        )
+        axes[0].set_title(f"{label_a} pat30 vs pat100")
+        axes[0].legend()
+
+        # 2) B pat30 vs B pat100
+        axes[1].hist(
+            masses_b_pat30[mode],
+            bins=bins,
+            range=range_,
+            density=density,
+            histtype="step",
+            linewidth=2,
+            label=f"{label_b} pat30",
+        )
+        axes[1].hist(
+            masses_b_pat100[mode],
+            bins=bins,
+            range=range_,
+            density=density,
+            histtype="step",
+            linewidth=2,
+            label=f"{label_b} pat100",
+        )
+        axes[1].set_title(f"{label_b} pat30 vs pat100")
+        axes[1].legend()
+
+        # 3) A vs B at pat30
+        axes[2].hist(
+            masses_a_pat30[mode],
+            bins=bins,
+            range=range_,
+            density=density,
+            histtype="step",
+            linewidth=2,
+            label=f"{label_a} pat30",
+        )
+        axes[2].hist(
+            masses_b_pat30[mode],
+            bins=bins,
+            range=range_,
+            density=density,
+            histtype="step",
+            linewidth=2,
+            label=f"{label_b} pat30",
+        )
+        axes[2].set_title(f"{label_a} vs {label_b} (pat30)")
+        axes[2].legend()
+
+        # 4) A vs B at pat100
+        axes[3].hist(
+            masses_a_pat100[mode],
+            bins=bins,
+            range=range_,
+            density=density,
+            histtype="step",
+            linewidth=2,
+            label=f"{label_a} pat100",
+        )
+        axes[3].hist(
+            masses_b_pat100[mode],
+            bins=bins,
+            range=range_,
+            density=density,
+            histtype="step",
+            linewidth=2,
+            label=f"{label_b} pat100",
+        )
+        axes[3].set_title(f"{label_a} vs {label_b} (pat100)")
+        axes[3].legend()
+
+        if add_higgs_line:
+            for ax in axes:
+                ax.axvline(125, linestyle="--", linewidth=1)
+
+        fig.suptitle(f"{main_title} — {mode}", fontsize=14)
         plt.tight_layout()
         plt.show()

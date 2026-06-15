@@ -8,6 +8,76 @@ import numpy as np
 import pandas as pd
 
 
+
+# Creare i dataframe con tutte le features + b-tagging:
+def build_df_from_npz_btag(data, process, label):
+    x_taus = data["x_taus"]
+    x_met  = data["x_met"]
+    x_jets = data["x_jets"]
+    x_gen  = data["x_gen"]
+
+    tau_features = [
+        "pt", "eta", "phi", "mass",
+        "dxy", "dz", "ptCorrPNet",
+        "rawPNetVSjet", "rawDeepTau2018v2p5VSjet",
+        "charge",
+        "dM_0", "dM_1", "dM_2", "dM_10", "dM_11",
+        "leadTkDeltaEta", "leadTkDeltaPhi",
+        "leadTkPtOverTauPt"
+    ]
+
+    met_features = [
+        "pt", "phi", "covXX", "covXY",
+        "covYY", "significance",
+        "sumEt", "sumPtUnclustered"
+    ]
+
+    jet_features = [
+        "pt", "eta", "phi", "mass",
+        "btagDeepFlavB",
+        "btagDeepFlavCvB",
+        "btagDeepFlavCvL",
+        "btagDeepFlavQG",
+        "btagPNetB",
+        "btagPNetCvB",
+        "btagPNetCvL",
+        "btagPNetQvG",
+        "btagPNetTauVJet",
+        "btagRobustParTAK4B",
+        "btagRobustParTAK4CvB",
+        "btagRobustParTAK4CvL",
+        "btagRobustParTAK4QG"
+    ]
+
+    gen_features = ["pt", "eta", "phi", "mass"]
+
+    cols = {}
+
+    for itau in range(2):
+        for ifeat, feat in enumerate(tau_features):
+            cols[f"tau{itau+1}_{feat}"] = x_taus[:, itau, ifeat]
+
+    for ifeat, feat in enumerate(met_features):
+        cols[f"MET_{feat}"] = x_met[:, 0, ifeat]
+
+    for ijet in range(3):
+        for ifeat, feat in enumerate(jet_features):
+            cols[f"jet{ijet+1}_{feat}"] = x_jets[:, ijet, ifeat]
+
+    for itau in range(2):
+        for ifeat, feat in enumerate(gen_features):
+            cols[f"tau{itau+1}_gen_{feat}"] = x_gen[:, itau, ifeat]
+
+    for key in ["m_vis", "m_vis_ptcorr", "m_gen", "m_fastmtt"]:
+        cols[key] = data[key]
+
+    df = pd.DataFrame(cols)
+
+    df["process"] = process
+    df["label"] = label
+
+    return df
+
 # ============================================================
 # Config:
 # - Come voglio fare il cut in pt:
@@ -335,3 +405,61 @@ def add_pt_and_targets(df: pd.DataFrame, use_clip: bool = True) -> pd.DataFrame:
         out["tau2_corr"] = out["gen_tau2_pt"] / out["tau2_pt_reco_corrPNet"]
 
     return out
+
+
+# ============================================
+# Selezione sui jet : 
+#       - esistono almeno due jet per evento
+#       - i due jet hanno pT > 20 GeV
+# ============================================
+def apply_jet_selection(
+    df,
+    pt_min_jet=20.0,
+):
+    # Esistenza dei jet: quadrimomento non nullo
+    jet1_exists = (
+        (df["jet1_logpt"] != 0) &
+        (df["jet1_eta"]   != 0) &
+        (df["jet1_phi"]   != 0) &
+        (df["jet1_mass"]  != 0)
+    )
+
+    jet2_exists = (
+        (df["jet2_logpt"] != 0) &
+        (df["jet2_eta"]   != 0) &
+        (df["jet2_phi"]   != 0) &
+        (df["jet2_mass"]  != 0)
+    )
+
+    jet3_exists = (
+        (df["jet3_logpt"] != 0) &
+        (df["jet3_eta"]   != 0) &
+        (df["jet3_phi"]   != 0) &
+        (df["jet3_mass"]  != 0)
+    )
+
+    # Almeno 2 jet esistenti
+    n_jets = (
+        jet1_exists.astype(int) +
+        jet2_exists.astype(int) +
+        jet3_exists.astype(int)
+    )
+    mask_2jets = n_jets >= 2
+
+    df_2jets = df[mask_2jets].copy()
+
+    # pT dei jet
+    jet1_pt = np.exp(df_2jets["jet1_logpt"])
+    jet2_pt = np.exp(df_2jets["jet2_logpt"])
+    jet3_pt = np.exp(df_2jets["jet3_logpt"])
+
+    # Conteggio jet con pT > soglia
+    n_jets_pt = (
+        (jet1_pt > pt_min_jet).astype(int) +
+        (jet2_pt > pt_min_jet).astype(int) +
+        (jet3_pt > pt_min_jet).astype(int)
+    )
+    mask_pt20 = n_jets_pt >= 2
+
+    df_sel = df_2jets[mask_pt20].copy()
+    return df_sel
